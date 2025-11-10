@@ -1,12 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  ActivityIndicator,
+  FlatList,
   LayoutChangeEvent,
   PanResponder,
   Platform,
   Pressable,
+  ScrollView,
   StyleSheet,
+  Switch,
   View,
 } from 'react-native';
+import { useRouter } from 'expo-router';
+import { Accelerometer } from 'expo-sensors';
 import Animated, {
   FadeIn,
   FadeOut,
@@ -49,6 +55,57 @@ const TILE_COLORS: Record<number, { background: string; color: string }> = {
   1024: { background: '#edc53f', color: '#f9f6f2' },
   2048: { background: '#edc22e', color: '#f9f6f2' },
 };
+
+const MENU_ITEMS = [
+  {
+    id: 'leaderboard',
+    label: 'Leaderboard',
+    description: 'Live community data',
+  },
+  {
+    id: 'sensors',
+    label: 'Motion Control',
+    description: 'Shake for a new game',
+  },
+  {
+    id: 'history',
+    label: 'Recent Runs',
+    description: 'Track your sessions',
+  },
+  {
+    id: 'strategy',
+    label: 'Strategy Center',
+    description: 'Open the tips modal',
+  },
+] as const;
+
+type MenuAction = (typeof MENU_ITEMS)[number]['id'];
+type MenuSection = Exclude<MenuAction, 'strategy'>;
+
+type LeaderboardEntry = {
+  id: string;
+  name: string;
+  location: string;
+  score: number;
+};
+
+type GameResetReason = 'manual' | 'sensor' | 'menu';
+
+type RecentRun = {
+  id: number;
+  score: number;
+  timestamp: string;
+  triggeredBy: GameResetReason;
+};
+
+type SensorVector = {
+  x: number;
+  y: number;
+  z: number;
+};
+
+const SHAKE_THRESHOLD = 1.8;
+const SHAKE_DEBOUNCE_MS = 2200;
 
 type MoveResult = {
   tiles: Tile[];
@@ -343,6 +400,7 @@ function getTileColors(value: number) {
 }
 
 export default function HomeScreen() {
+  const router = useRouter();
   const tileIdRef = useRef(0);
   const getNextTileId = useCallback(() => {
     tileIdRef.current += 1;
@@ -355,23 +413,167 @@ export default function HomeScreen() {
   const [gameOver, setGameOver] = useState(false);
   const [hasWon, setHasWon] = useState(false);
   const [boardSize, setBoardSize] = useState(0);
+  const [menuSelection, setMenuSelection] = useState<MenuSection>('leaderboard');
+  const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>([]);
+  const [leaderboardLoading, setLeaderboardLoading] = useState(true);
+  const [leaderboardError, setLeaderboardError] = useState<string | null>(null);
+  const [sensorData, setSensorData] = useState<SensorVector>({ x: 0, y: 0, z: 0 });
+  const [sensorEnabled, setSensorEnabled] = useState(true);
+  const [sensorSupported, setSensorSupported] = useState(true);
+  const [systemNotification, setSystemNotification] = useState<string | null>(null);
+  const lastShakeTimeRef = useRef(0);
+  const [recentRuns, setRecentRuns] = useState<RecentRun[]>([]);
+  const scoreRef = useRef(0);
+  const [boardDragging, setBoardDragging] = useState(false);
 
   const tileSize =
     boardSize > 0
       ? (boardSize - BOARD_PADDING * 2 - CELL_GAP * (BOARD_SIZE - 1)) / BOARD_SIZE
       : 0;
 
+  useEffect(() => {
+    scoreRef.current = score;
+  }, [score]);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    const fetchLeaderboard = async () => {
+      try {
+        setLeaderboardLoading(true);
+        setLeaderboardError(null);
+
+        const response = await fetch('https://jsonplaceholder.typicode.com/users?_limit=6');
+        if (!response.ok) {
+          throw new Error('Leaderboard request failed');
+        }
+
+        type RemoteUser = { id: number; name: string; address: { city: string } };
+        const data = (await response.json()) as RemoteUser[];
+
+        if (!isMounted) {
+          return;
+        }
+
+        const hydrated = data.map((user) => ({
+          id: String(user.id),
+          name: user.name,
+          location: user.address?.city ?? 'Unknown city',
+          score: 1800 + user.id * 128,
+        }));
+
+        setLeaderboard(hydrated);
+      } catch {
+        if (isMounted) {
+          setLeaderboardError('Unable to reach the community leaderboard right now.');
+        }
+      } finally {
+        if (isMounted) {
+          setLeaderboardLoading(false);
+        }
+      }
+    };
+
+    fetchLeaderboard();
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
   const handleBoardLayout = useCallback((event: LayoutChangeEvent) => {
     setBoardSize(event.nativeEvent.layout.width);
   }, []);
 
-  const handleNewGame = useCallback(() => {
-    tileIdRef.current = 0;
-    setTiles(generateInitialTiles(getNextTileId));
-    setScore(0);
-    setGameOver(false);
-    setHasWon(false);
-  }, [getNextTileId]);
+  const handleNewGame = useCallback(
+    (reason: GameResetReason = 'manual') => {
+      const previousScore = scoreRef.current;
+
+      setRecentRuns((runs) => {
+        if (previousScore <= 0) {
+          return runs;
+        }
+
+        const nextEntry: RecentRun = {
+          id: Date.now(),
+          score: previousScore,
+          timestamp: new Date().toLocaleTimeString(),
+          triggeredBy: reason,
+        };
+
+        return [nextEntry, ...runs].slice(0, 5);
+      });
+
+      tileIdRef.current = 0;
+      setTiles(generateInitialTiles(getNextTileId));
+      setScore(0);
+      setGameOver(false);
+      setHasWon(false);
+      if (reason === 'menu') {
+        setSystemNotification('Score saved. Fresh board ready!');
+      }
+    },
+    [getNextTileId],
+  );
+
+  useEffect(() => {
+    let isMounted = true;
+
+    Accelerometer.isAvailableAsync()
+      .then((available) => {
+        if (!isMounted) {
+          return;
+        }
+
+        setSensorSupported(available);
+        if (!available) {
+          setSensorEnabled(false);
+        }
+      })
+      .catch(() => {
+        if (isMounted) {
+          setSensorSupported(false);
+          setSensorEnabled(false);
+        }
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!sensorEnabled || !sensorSupported) {
+      return undefined;
+    }
+
+    Accelerometer.setUpdateInterval(120);
+    const subscription = Accelerometer.addListener((vector: SensorVector) => {
+      setSensorData(vector);
+
+      const magnitude = Math.sqrt(vector.x * vector.x + vector.y * vector.y + vector.z * vector.z);
+      const now = Date.now();
+
+      if (magnitude > SHAKE_THRESHOLD && now - lastShakeTimeRef.current > SHAKE_DEBOUNCE_MS) {
+        lastShakeTimeRef.current = now;
+        setSystemNotification('Shake detected! Starting a new game.');
+        handleNewGame('sensor');
+      }
+    });
+
+    return () => {
+      subscription.remove();
+    };
+  }, [sensorEnabled, sensorSupported, handleNewGame]);
+
+  useEffect(() => {
+    if (!systemNotification) {
+      return undefined;
+    }
+
+    const timeout = setTimeout(() => setSystemNotification(null), 3500);
+    return () => clearTimeout(timeout);
+  }, [systemNotification]);
 
   const handleMove = useCallback(
     (direction: Direction) => {
@@ -444,9 +646,18 @@ export default function HomeScreen() {
   const panResponder = useMemo(
     () =>
       PanResponder.create({
+        onStartShouldSetPanResponder: () => true,
+        onMoveShouldSetPanResponderCapture: () => true,
         onMoveShouldSetPanResponder: (_, gestureState) =>
           Math.abs(gestureState.dx) > 12 || Math.abs(gestureState.dy) > 12,
+        onPanResponderGrant: () => {
+          setBoardDragging(true);
+        },
+        onPanResponderTerminate: () => {
+          setBoardDragging(false);
+        },
         onPanResponderRelease: (_, gestureState) => {
+          setBoardDragging(false);
           const { dx, dy } = gestureState;
           if (Math.abs(dx) < 12 && Math.abs(dy) < 12) {
             return;
@@ -462,89 +673,276 @@ export default function HomeScreen() {
     [handleMove],
   );
 
+  const axisReadings = [
+    { label: 'X', value: sensorData.x },
+    { label: 'Y', value: sensorData.y },
+    { label: 'Z', value: sensorData.z },
+  ];
+
+  const formatAxisValue = (value: number) => value.toFixed(2);
+
   return (
     <ThemedView style={styles.screen}>
-      <View style={styles.header}>
-        <ThemedText type="title" style={styles.title}>
-          2048
-        </ThemedText>
-        <View style={styles.scores}>
-          <View style={styles.scoreBox}>
-            <ThemedText type="defaultSemiBold" style={styles.scoreLabel}>
-              Score
-            </ThemedText>
-            <ThemedText type="title" style={styles.scoreValue}>
-              {score}
-            </ThemedText>
-          </View>
-          <View style={styles.scoreBox}>
-            <ThemedText type="defaultSemiBold" style={styles.scoreLabel}>
-              Best
-            </ThemedText>
-            <ThemedText type="title" style={styles.scoreValue}>
-              {bestScore}
-            </ThemedText>
+      <ScrollView
+        style={styles.scroll}
+        contentContainerStyle={styles.scrollContent}
+        scrollEnabled={!boardDragging}
+        showsVerticalScrollIndicator={false}>
+        <View style={styles.header}>
+          <ThemedText type="title" style={styles.title}>
+            2048
+          </ThemedText>
+          <View style={styles.scores}>
+            <View style={[styles.scoreBox, styles.scoreBoxPrimary]}>
+              <ThemedText type="defaultSemiBold" style={styles.scoreLabel}>
+                Score
+              </ThemedText>
+              <ThemedText type="title" style={styles.scoreValue}>
+                {score}
+              </ThemedText>
+            </View>
+            <View style={styles.scoreBox}>
+              <ThemedText type="defaultSemiBold" style={styles.scoreLabel}>
+                Best
+              </ThemedText>
+              <ThemedText type="title" style={styles.scoreValue}>
+                {bestScore}
+              </ThemedText>
+            </View>
           </View>
         </View>
-      </View>
 
-      <View style={styles.actions}>
-        <Pressable style={styles.button} onPress={handleNewGame}>
-          <ThemedText type="defaultSemiBold" style={styles.buttonText}>
-            New Game
-          </ThemedText>
-        </Pressable>
-      </View>
+        <View style={styles.actions}>
+          <Pressable style={styles.button} onPress={() => handleNewGame('manual')}>
+            <ThemedText type="defaultSemiBold" style={styles.buttonText}>
+              New Game
+            </ThemedText>
+          </Pressable>
+          <Pressable
+            style={[styles.button, styles.secondaryButton, styles.buttonLast]}
+            onPress={() => router.push('/modal')}>
+            <ThemedText type="defaultSemiBold" style={styles.secondaryButtonText}>
+              Strategy
+            </ThemedText>
+          </Pressable>
+        </View>
 
-      <View style={styles.statusContainer}>
-        {hasWon && (
-          <ThemedText type="defaultSemiBold" style={styles.statusText}>
-            You reached 2048! Keep going for a higher score.
-          </ThemedText>
-        )}
-        {gameOver && (
-          <ThemedText type="defaultSemiBold" style={styles.statusText}>
-            No moves left. Start a new game to try again.
-          </ThemedText>
-        )}
-      </View>
+        <View style={styles.statusContainer}>
+          {hasWon && (
+            <ThemedText type="defaultSemiBold" style={styles.statusText}>
+              You reached 2048! Keep going for a higher score.
+            </ThemedText>
+          )}
+          {gameOver && (
+            <ThemedText type="defaultSemiBold" style={styles.statusText}>
+              No moves left. Start a new game to try again.
+            </ThemedText>
+          )}
+        </View>
 
-      <View
-        style={styles.boardContainer}
-        onLayout={handleBoardLayout}
-        {...panResponder.panHandlers}>
-        {tileSize > 0 &&
-          Array.from({ length: BOARD_SIZE * BOARD_SIZE }, (_, index) => {
-            const row = Math.floor(index / BOARD_SIZE);
-            const col = index % BOARD_SIZE;
+        <View
+          style={styles.boardContainer}
+          onLayout={handleBoardLayout}
+          {...panResponder.panHandlers}>
+          {tileSize > 0 &&
+            Array.from({ length: BOARD_SIZE * BOARD_SIZE }, (_, index) => {
+              const row = Math.floor(index / BOARD_SIZE);
+              const col = index % BOARD_SIZE;
 
-            return (
-              <View
-                key={`cell-${row}-${col}`}
-                style={[
-                  styles.backgroundCell,
-                  {
-                    width: tileSize,
-                    height: tileSize,
-                    top: BOARD_PADDING + row * (tileSize + CELL_GAP),
-                    left: BOARD_PADDING + col * (tileSize + CELL_GAP),
-                  },
-                ]}
+              return (
+                <View
+                  key={`cell-${row}-${col}`}
+                  style={[
+                    styles.backgroundCell,
+                    {
+                      width: tileSize,
+                      height: tileSize,
+                      top: BOARD_PADDING + row * (tileSize + CELL_GAP),
+                      left: BOARD_PADDING + col * (tileSize + CELL_GAP),
+                    },
+                  ]}
+                />
+              );
+            })}
+
+          {tileSize > 0 &&
+            tiles.map((tile) => (
+              <TileView
+                key={tile.id}
+                tile={tile}
+                size={tileSize}
+                gap={CELL_GAP}
+                padding={BOARD_PADDING}
               />
-            );
-          })}
+            ))}
+        </View>
 
-        {tileSize > 0 &&
-          tiles.map((tile) => (
-            <TileView
-              key={tile.id}
-              tile={tile}
-              size={tileSize}
-              gap={CELL_GAP}
-              padding={BOARD_PADDING}
-            />
-          ))}
-      </View>
+        <View style={styles.menuContainer}>
+          <ThemedText type="defaultSemiBold" style={styles.menuHeading}>
+            Control Center
+          </ThemedText>
+          <FlatList
+            data={MENU_ITEMS}
+            horizontal
+            keyExtractor={(item) => item.id}
+            showsHorizontalScrollIndicator={false}
+            contentContainerStyle={styles.menuList}
+            renderItem={({ item }) => {
+              const isAction = item.id === 'strategy';
+              const isActive = !isAction && menuSelection === item.id;
+
+              return (
+                <Pressable
+                  style={[
+                    styles.menuCard,
+                    isActive && styles.menuCardActive,
+                    isAction && styles.menuCardStrategy,
+                  ]}
+                  onPress={() => {
+                    if (isAction) {
+                      router.push('/modal');
+                      return;
+                    }
+                    setMenuSelection(item.id as MenuSection);
+                  }}>
+                  <ThemedText
+                    type="defaultSemiBold"
+                    style={[styles.menuLabel, isAction && styles.menuLabelInverse]}>
+                    {item.label}
+                  </ThemedText>
+                  <ThemedText
+                    style={[
+                      styles.menuDescription,
+                      isAction && styles.menuDescriptionInverse,
+                    ]}>
+                    {item.description}
+                  </ThemedText>
+                </Pressable>
+              );
+            }}
+          />
+        </View>
+
+        <View style={styles.cardStack}>
+          <View style={[styles.card, menuSelection === 'leaderboard' && styles.cardActive]}>
+            <View style={styles.cardHeader}>
+              <ThemedText type="defaultSemiBold">Community leaderboard</ThemedText>
+              {leaderboardLoading && <ActivityIndicator size="small" color="#8f7a66" />}
+            </View>
+            {leaderboardError ? (
+              <ThemedText style={styles.errorText}>{leaderboardError}</ThemedText>
+            ) : (
+              <FlatList
+                data={leaderboard}
+                keyExtractor={(item) => item.id}
+                scrollEnabled={false}
+                renderItem={({ item, index }) => (
+                  <View style={styles.leaderboardRow}>
+                    <ThemedText style={styles.leaderboardRank}>{index + 1}</ThemedText>
+                    <View style={styles.leaderboardInfo}>
+                      <ThemedText style={styles.leaderboardName}>{item.name}</ThemedText>
+                      <ThemedText style={styles.leaderboardMeta}>{item.location}</ThemedText>
+                    </View>
+                    <ThemedText style={styles.leaderboardScore}>{item.score}</ThemedText>
+                  </View>
+                )}
+                ItemSeparatorComponent={() => <View style={styles.leaderboardDivider} />}
+                ListEmptyComponent={
+                  !leaderboardLoading ? (
+                    <ThemedText style={styles.helperText}>
+                      Leaderboard data will appear once we finish loading the feed.
+                    </ThemedText>
+                  ) : null
+                }
+              />
+            )}
+          </View>
+
+          <View style={[styles.card, menuSelection === 'sensors' && styles.cardActive]}>
+            <View style={styles.cardHeader}>
+              <ThemedText type="defaultSemiBold">Device motion</ThemedText>
+              <Switch
+                value={sensorEnabled}
+                onValueChange={setSensorEnabled}
+                disabled={!sensorSupported}
+                trackColor={{ false: '#d1c9bc', true: '#8f7a66' }}
+                thumbColor="#f9f6f2"
+                ios_backgroundColor="#d1c9bc"
+              />
+            </View>
+            {!sensorSupported ? (
+              <ThemedText style={styles.helperText}>
+                Motion sensors are not available in this environment.
+              </ThemedText>
+            ) : (
+              <View style={styles.sensorGrid}>
+                {axisReadings.map((axis) => (
+                  <View key={axis.label} style={styles.sensorRow}>
+                    <ThemedText style={styles.sensorAxis}>{axis.label}</ThemedText>
+                    <ThemedText style={styles.sensorValue}>
+                      {formatAxisValue(axis.value)}
+                    </ThemedText>
+                  </View>
+                ))}
+              </View>
+            )}
+            <ThemedText style={styles.helperText}>
+              Shake harder than {SHAKE_THRESHOLD.toFixed(1)}g to auto-start a new game.
+            </ThemedText>
+            {systemNotification && (
+              <View style={styles.sensorBanner}>
+                <ThemedText style={styles.sensorStatus}>{systemNotification}</ThemedText>
+              </View>
+            )}
+          </View>
+
+          <View style={[styles.card, menuSelection === 'history' && styles.cardActive]}>
+            <View style={styles.cardHeader}>
+              <ThemedText type="defaultSemiBold">Recent runs</ThemedText>
+              <ThemedText style={styles.cardMeta}>
+                {recentRuns.length > 0 ? `Best ${recentRuns[0].score}` : 'Play to log runs'}
+              </ThemedText>
+            </View>
+            <Pressable style={styles.linkButton} onPress={() => handleNewGame('menu')}>
+              <ThemedText type="defaultSemiBold" style={styles.linkButtonText}>
+                Save score & restart
+              </ThemedText>
+            </Pressable>
+            {recentRuns.length === 0 ? (
+              <ThemedText style={styles.helperText}>
+                Finish a round or trigger the shake gesture to start building this history.
+              </ThemedText>
+            ) : (
+              <FlatList
+                data={recentRuns}
+                keyExtractor={(item) => item.id.toString()}
+                scrollEnabled={false}
+                renderItem={({ item }) => (
+                  <View style={styles.historyRow}>
+                    <View style={styles.historyScoreGroup}>
+                      <ThemedText style={styles.historyScore}>{item.score}</ThemedText>
+                      <ThemedText style={styles.historyMeta}>
+                        {item.timestamp} ·{' '}
+                        {item.triggeredBy === 'sensor'
+                          ? 'Shake reset'
+                          : item.triggeredBy === 'menu'
+                            ? 'Menu action'
+                            : 'Manual'}
+                      </ThemedText>
+                    </View>
+                    <View style={styles.historyBadge}>
+                      <ThemedText style={styles.historyBadgeText}>
+                        {item.triggeredBy.toUpperCase()}
+                      </ThemedText>
+                    </View>
+                  </View>
+                )}
+                ItemSeparatorComponent={() => <View style={styles.historyDivider} />}
+              />
+            )}
+          </View>
+        </View>
+      </ScrollView>
     </ThemedView>
   );
 }
@@ -552,8 +950,15 @@ export default function HomeScreen() {
 const styles = StyleSheet.create({
   screen: {
     flex: 1,
-    padding: 24,
-    justifyContent: 'flex-start',
+  },
+  scroll: {
+    flex: 1,
+    width: '100%',
+  },
+  scrollContent: {
+    paddingHorizontal: 24,
+    paddingTop: 24,
+    paddingBottom: 64,
   },
   header: {
     flexDirection: 'row',
@@ -573,8 +978,10 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     paddingHorizontal: 16,
     paddingVertical: 8,
-    marginLeft: 8,
     alignItems: 'center',
+  },
+  scoreBoxPrimary: {
+    marginRight: 8,
   },
   scoreLabel: {
     color: '#f9f6f2',
@@ -587,7 +994,9 @@ const styles = StyleSheet.create({
   },
   actions: {
     flexDirection: 'row',
-    justifyContent: 'flex-end',
+    alignItems: 'center',
+    justifyContent: 'flex-start',
+    flexWrap: 'wrap',
     marginBottom: 16,
   },
   button: {
@@ -595,9 +1004,25 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingVertical: 12,
     borderRadius: 8,
+    minWidth: 120,
+    alignItems: 'center',
+    marginRight: 12,
+    marginBottom: 8,
+  },
+  buttonLast: {
+    marginRight: 0,
   },
   buttonText: {
     color: '#f9f6f2',
+    fontSize: 16,
+  },
+  secondaryButton: {
+    backgroundColor: 'transparent',
+    borderWidth: 1,
+    borderColor: '#8f7a66',
+  },
+  secondaryButtonText: {
+    color: '#8f7a66',
     fontSize: 16,
   },
   statusContainer: {
@@ -617,6 +1042,178 @@ const styles = StyleSheet.create({
     position: 'relative',
     alignSelf: 'center',
     overflow: 'hidden',
+    marginBottom: 24,
+  },
+  menuContainer: {
+    marginBottom: 16,
+  },
+  menuHeading: {
+    marginBottom: 8,
+    color: '#776e65',
+  },
+  menuList: {
+    paddingRight: 16,
+  },
+  menuCard: {
+    backgroundColor: '#f2eadd',
+    padding: 12,
+    borderRadius: 12,
+    marginRight: 12,
+    width: 180,
+  },
+  menuCardActive: {
+    borderWidth: 2,
+    borderColor: '#8f7a66',
+  },
+  menuCardStrategy: {
+    backgroundColor: '#3c3a32',
+  },
+  menuLabel: {
+    color: '#3c3a32',
+    fontSize: 16,
+  },
+  menuLabelInverse: {
+    color: '#f9f6f2',
+  },
+  menuDescription: {
+    color: '#776e65',
+    fontSize: 13,
+    marginTop: 4,
+  },
+  menuDescriptionInverse: {
+    color: '#f9f6f2',
+  },
+  cardStack: {
+    marginBottom: 32,
+  },
+  card: {
+    backgroundColor: '#fdf8ef',
+    borderRadius: 16,
+    padding: 16,
+    marginBottom: 16,
+  },
+  cardActive: {
+    borderWidth: 2,
+    borderColor: '#8f7a66',
+  },
+  cardHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 12,
+  },
+  cardMeta: {
+    color: '#8f7a66',
+    fontSize: 13,
+  },
+  errorText: {
+    color: '#b5472b',
+  },
+  helperText: {
+    color: '#8f7a66',
+    fontSize: 13,
+    marginTop: 8,
+  },
+  leaderboardRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 6,
+  },
+  leaderboardRank: {
+    width: 28,
+    color: '#8f7a66',
+    fontWeight: '700',
+  },
+  leaderboardInfo: {
+    flex: 1,
+    paddingRight: 12,
+  },
+  leaderboardName: {
+    color: '#3c3a32',
+    fontWeight: '600',
+  },
+  leaderboardMeta: {
+    color: '#8f7a66',
+    fontSize: 12,
+  },
+  leaderboardScore: {
+    color: '#3c3a32',
+    fontWeight: '700',
+  },
+  leaderboardDivider: {
+    height: 1,
+    backgroundColor: 'rgba(0,0,0,0.05)',
+  },
+  sensorGrid: {
+    marginTop: 4,
+  },
+  sensorRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingVertical: 4,
+  },
+  sensorAxis: {
+    color: '#3c3a32',
+    fontWeight: '600',
+  },
+  sensorValue: {
+    color: '#3c3a32',
+    fontVariant: ['tabular-nums'],
+    fontWeight: '600',
+  },
+  sensorBanner: {
+    marginTop: 12,
+    backgroundColor: '#e0f2e7',
+    borderRadius: 8,
+    padding: 10,
+  },
+  sensorStatus: {
+    color: '#1d6633',
+    fontWeight: '600',
+  },
+  linkButton: {
+    alignSelf: 'flex-start',
+    marginBottom: 8,
+    paddingVertical: 6,
+  },
+  linkButtonText: {
+    color: '#8f7a66',
+    fontSize: 14,
+  },
+  historyRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 8,
+  },
+  historyScoreGroup: {
+    flex: 1,
+    paddingRight: 12,
+  },
+  historyScore: {
+    color: '#3c3a32',
+    fontWeight: '700',
+    fontSize: 20,
+  },
+  historyMeta: {
+    color: '#8f7a66',
+    fontSize: 12,
+  },
+  historyBadge: {
+    backgroundColor: '#eee0c8',
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 4,
+  },
+  historyBadgeText: {
+    color: '#8f7a66',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  historyDivider: {
+    height: 1,
+    backgroundColor: 'rgba(0,0,0,0.05)',
   },
   backgroundCell: {
     position: 'absolute',
