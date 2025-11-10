@@ -1,4 +1,3 @@
-import { Link } from 'expo-router';
 import { FlatList, StyleSheet, View } from 'react-native';
 
 import { ThemedText } from '@/components/themed-text';
@@ -23,7 +22,7 @@ const STRATEGY_TIPS = [
     checklist: [
       'Keep the second-highest tile adjacent to the corner tile.',
       'Mirror the pattern along the row before working on the next column.',
-      'If you misplace a tile, undo quickly with the new Save & Restart action.',
+      'If you misplace a tile, undo quickly with the Save & Restart action.',
     ],
   },
   {
@@ -39,11 +38,11 @@ const STRATEGY_TIPS = [
   },
 ] as const;
 
-export default function ModalScreen() {
+export default function StrategyCenterScreen() {
   return (
     <ThemedView style={styles.container}>
       <ThemedText type="title" style={styles.title}>
-        Strategy Center
+        Strategy center
       </ThemedText>
       <ThemedText style={styles.subtitle}>
         Quick coaching notes you can act on while you play the upgraded 2048 board.
@@ -52,7 +51,6 @@ export default function ModalScreen() {
         data={STRATEGY_TIPS}
         keyExtractor={(item) => item.id}
         contentContainerStyle={styles.listContent}
-        showsVerticalScrollIndicator={false}
         renderItem={({ item }) => (
           <View style={styles.card}>
             <ThemedText type="defaultSemiBold" style={styles.cardTitle}>
@@ -67,16 +65,6 @@ export default function ModalScreen() {
             ))}
           </View>
         )}
-        ListFooterComponent={
-          <View style={styles.footer}>
-            <ThemedText style={styles.footerText}>
-              Need more? Open the Explore tab for templates or share your run with teammates.
-            </ThemedText>
-            <Link href="/" dismissTo style={styles.link}>
-              <ThemedText type="link">Back to the board</ThemedText>
-            </Link>
-          </View>
-        }
       />
     </ThemedView>
   );
@@ -86,6 +74,7 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     padding: 24,
+    gap: 12,
   },
   title: {
     textAlign: 'center',
@@ -96,47 +85,35 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   listContent: {
+    paddingTop: 4,
     paddingBottom: 40,
+    gap: 16,
   },
   card: {
     backgroundColor: '#fdf8ef',
     borderRadius: 16,
     padding: 16,
-    marginBottom: 16,
+    gap: 8,
   },
   cardTitle: {
-    marginBottom: 6,
+    marginBottom: 2,
   },
   cardSummary: {
     color: '#776e65',
-    marginBottom: 8,
   },
   checkRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    marginBottom: 6,
+    gap: 8,
   },
   checkBullet: {
     width: 6,
     height: 6,
     borderRadius: 3,
     backgroundColor: '#8f7a66',
-    marginRight: 8,
   },
   checkText: {
     flex: 1,
     color: '#3c3a32',
-  },
-  footer: {
-    marginTop: 12,
-    alignItems: 'center',
-  },
-  footerText: {
-    color: '#776e65',
-    textAlign: 'center',
-    marginBottom: 8,
-  },
-  link: {
-    paddingVertical: 10,
   },
 });
